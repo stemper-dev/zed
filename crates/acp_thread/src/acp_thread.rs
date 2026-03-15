@@ -970,6 +970,7 @@ pub struct AcpThread {
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
+    terminal_output_flush_task: Option<Task<()>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
@@ -992,6 +993,83 @@ struct StreamingTextBuffer {
     target: Entity<Markdown>,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
+}
+
+impl AcpThread {
+    const TERMINAL_OUTPUT_FLUSH_UPDATE_MS: u64 = 16;
+
+    fn queue_terminal_output(
+        &mut self,
+        terminal_id: acp::TerminalId,
+        data: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_terminal_output
+            .entry(terminal_id)
+            .or_default()
+            .push(data);
+
+        if self.terminal_output_flush_task.is_none() {
+            self.terminal_output_flush_task = Some(self.start_terminal_output_flush(cx));
+        }
+    }
+
+    fn flush_terminal_output_for(
+        &mut self,
+        terminal_id: &acp::TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entity) = self.terminals.get(terminal_id).cloned() else {
+            return;
+        };
+
+        let Some(chunks) = self.pending_terminal_output.remove(terminal_id) else {
+            return;
+        };
+
+        entity.update(cx, |term, cx| {
+            term.inner().update(cx, |inner, cx| {
+                for chunk in chunks {
+                    inner.write_output(&chunk, cx);
+                }
+            })
+        });
+    }
+
+    fn start_terminal_output_flush(&self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(Self::TERMINAL_OUTPUT_FLUSH_UPDATE_MS))
+                    .await;
+
+                let should_continue = this
+                    .update(cx, |this, cx| {
+                        if this.pending_terminal_output.is_empty() {
+                            this.terminal_output_flush_task = None;
+                            return false;
+                        }
+
+                        let pending_terminal_ids = this
+                            .pending_terminal_output
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>();
+
+                        for terminal_id in pending_terminal_ids {
+                            this.flush_terminal_output_for(&terminal_id, cx);
+                        }
+
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+    }
 }
 
 impl StreamingTextBuffer {
@@ -1157,6 +1235,7 @@ impl AcpThread {
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
+            terminal_output_flush_task: None,
             pending_terminal_exit: HashMap::default(),
             had_error: false,
             draft_prompt: None,
@@ -1520,7 +1599,21 @@ impl AcpThread {
                     .ceil() as usize;
                 return;
             }
-            Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+
+            if !buffer.pending.is_empty() {
+                buffer
+                    .target
+                    .update(cx, |markdown, cx| markdown.append(&buffer.pending, cx));
+                buffer.pending.clear();
+            }
+
+            buffer.target = markdown.clone();
+            buffer.pending = text;
+            buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
+                / StreamingTextBuffer::REVEAL_TARGET
+                * StreamingTextBuffer::TASK_UPDATE_MS as f32)
+                .ceil() as usize;
+            return;
         }
 
         let target = markdown.clone();
@@ -1568,7 +1661,8 @@ impl AcpThread {
                         };
 
                         if buffer.pending.is_empty() {
-                            return true;
+                            this.streaming_text_buffer = None;
+                            return false;
                         }
 
                         let pending_len = buffer.pending.len();
@@ -2651,6 +2745,8 @@ impl AcpThread {
         terminal_id: acp::TerminalId,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        self.flush_terminal_output_for(&terminal_id, cx);
+
         self.terminals
             .get(&terminal_id)
             .context("Terminal not found")?
@@ -2749,15 +2845,7 @@ impl AcpThread {
                     cx,
                 );
 
-                if let Some(mut chunks) = self.pending_terminal_output.remove(&terminal_id) {
-                    for data in chunks.drain(..) {
-                        entity.update(cx, |term, cx| {
-                            term.inner().update(cx, |inner, cx| {
-                                inner.write_output(&data, cx);
-                            })
-                        });
-                    }
-                }
+                self.flush_terminal_output_for(&terminal_id, cx);
 
                 if let Some(_status) = self.pending_terminal_exit.remove(&terminal_id) {
                     entity.update(cx, |_term, cx| {
@@ -2768,18 +2856,7 @@ impl AcpThread {
                 cx.notify();
             }
             TerminalProviderEvent::Output { terminal_id, data } => {
-                if let Some(entity) = self.terminals.get(&terminal_id) {
-                    entity.update(cx, |term, cx| {
-                        term.inner().update(cx, |inner, cx| {
-                            inner.write_output(&data, cx);
-                        })
-                    });
-                } else {
-                    self.pending_terminal_output
-                        .entry(terminal_id)
-                        .or_default()
-                        .push(data);
-                }
+                self.queue_terminal_output(terminal_id, data, cx);
             }
             TerminalProviderEvent::TitleChanged { terminal_id, title } => {
                 if let Some(entity) = self.terminals.get(&terminal_id) {
